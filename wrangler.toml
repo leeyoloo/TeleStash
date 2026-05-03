@@ -1,0 +1,15 @@
+name = "telestash"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# KV namespace for file metadata
+# Create via: wrangler kv:namespace create METADATA
+# Then fill in the id below
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+[vars]
+TELEGRAM_BOT_TOKEN = "8704600479:AAFM5IGBzDJFGSgrf7or9mfaHXIw6fbH7G0"
+TELEGRAM_CHANNEL_ID = "-1003758037951"
+ADMIN_PASSWORD = "changeme"
