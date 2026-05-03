@@ -47,13 +47,62 @@ https://api.telegram.org/bot你的TOKEN/getUpdates
 
 找 `chat.id` 字段（负数，如 `-1001234567890`）
 
-### 第四步：部署到 Cloudflare
+---
+
+### 方式一：网页端部署（推荐新手）
+
+#### 1. 创建 KV 命名空间
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
+2. 左侧菜单 → **Workers 和 Pages** → **KV**
+3. 点击 **创建命名空间** → 名称填 `metadata` → **添加**
+4. **记下命名空间 ID**（一串字母数字）
+
+#### 2. 创建 Worker
+
+1. 左侧菜单 → **Workers 和 Pages**
+2. 点击 **创建应用程序** → **创建 Worker**
+3. 名称填 `telestash` → 点击 **部署**
+
+#### 3. 替换代码
+
+1. 部署后点击 **编辑代码**
+2. 在代码编辑器中 **全选删除** 默认代码（`Ctrl+A` → `Delete`）
+3. 打开 [worker.js](https://raw.githubusercontent.com/leeyoloo/TeleStash/main/worker.js) → 全选复制 → 粘贴到编辑器
+4. 点击右上角 **保存并部署**
+
+#### 4. 绑定 KV
+
+1. 回到 Worker 概览页 → **设置** → **绑定**
+2. 点击 **添加** → 选择 **KV 命名空间**
+3. 变量名称填 `KV` → KV 命名空间选择第一步创建的 `metadata`
+4. 点击 **添加绑定**
+
+#### 5. 配置环境变量
+
+1. **设置** → **变量和机密** → **添加变量**
+
+| 名称 | 类型 | 值 |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | **密钥** | 你的 Bot Token |
+| `TELEGRAM_CHANNEL_ID` | **变量** | 你的频道 ID（负数） |
+| `ADMIN_PASSWORD` | **密钥** | 你想设的登录密码 |
+
+> 💡 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_PASSWORD` 选**密钥**类型（加密存储），`TELEGRAM_CHANNEL_ID` 选**变量**。
+
+#### 6. 完成
+
+访问 `https://telestash.你的子域名.workers.dev`，输入密码即可使用。
+
+---
+
+### 方式二：命令行部署（Wrangler）
 
 ```bash
-# 1. 安装 wrangler CLI
+# 1. 安装 wrangler
 npm install -g wrangler
 
-# 2. 登录 Cloudflare
+# 2. 登录
 wrangler login
 
 # 3. 克隆项目
@@ -62,37 +111,14 @@ cd TeleStash
 
 # 4. 创建 KV 命名空间
 wrangler kv:namespace create METADATA
-# 输出类似: { binding = "KV", id = "xxxxxxxxxx" }
+# 记下输出的 id
 
 # 5. 编辑 wrangler.toml，填入 KV namespace id
-```
-
-编辑 `wrangler.toml`：
-
-```toml
-name = "telestash"
-main = "worker.js"
-compatibility_date = "2024-01-01"
-
-[[kv_namespaces]]
-binding = "KV"
-id = "你刚才获取的KV命名空间ID"
-```
-
-```bash
 # 6. 部署
 wrangler deploy
+
+# 7. 配置环境变量（同上，在 Dashboard 操作）
 ```
-
-### 第五步：配置环境变量
-
-在 Cloudflare Dashboard → **Workers** → **TeleStash** → **设置** → **变量和机密**：
-
-| 变量名 | 类型 | 说明 |
-|--------|------|------|
-| `TELEGRAM_BOT_TOKEN` | 密钥 | Bot 的 Token |
-| `TELEGRAM_CHANNEL_ID` | 变量 | 频道 ID（负数） |
-| `ADMIN_PASSWORD` | 密钥 | 管理员登录密码 |
 
 ## 📡 WebDAV 接入
 
@@ -207,14 +233,36 @@ Endpoint: `https://你的域名/opds`
 | GET | `/opds/*` | 浏览子目录 |
 | GET | `/opds/download/*` | 下载电子书 |
 
-## ⚠️ 限制
+## ⚠️ 限制与注意事项
 
-| 限制 | 说明 |
-|------|------|
-| 单文件 50MB | Telegram Bot API 限制 |
-| Worker CPU 10ms | Cloudflare 免费版限制 |
-| KV 写入 1000次/天 | Cloudflare 免费版限制 |
-| KV 读取 100K次/天 | Cloudflare 免费版限制 |
+### KV 免费额度限制
+
+| 限制项 | 免费额度 | 说明 |
+|--------|----------|------|
+| KV 读取 | **100,000 次/天** | 每次浏览文件列表消耗 1 次 |
+| KV 写入 | **1,000 次/天** | 每次上传/创建文件夹/删除消耗 1 次 |
+| KV 存储 | **1 GB** | 文件元数据很小，基本不会超 |
+| KV 单个 value | **25 MB** | 单个目录下的文件列表 JSON |
+| KV 单个 key | **512 bytes** | 路径长度限制 |
+
+> 💡 **实际影响**：免费版 KV 每天最多写入 1000 次，意味着每天最多上传/删除 **1000 个文件**。日常使用完全够用，批量迁移大量文件时需要注意。
+
+### 其他限制
+
+| 限制项 | 说明 |
+|--------|------|
+| 单文件 **50MB** | Telegram Bot API 上传限制 |
+| Worker CPU **10ms** | Cloudflare 免费版，一般够用 |
+| Worker 请求 **100K/天** | Cloudflare 免费版 |
+| KV 路径不支持某些字符 | 避免在文件名中使用 `\n`、`\r` 等控制字符 |
+
+### KV 超限怎么办？
+
+如果每天 1000 次写入不够用：
+
+1. **升级 Workers Paid 计划**（$5/月）：KV 写入提升到 **每天 1 亿次**，读取 **无限**
+2. **改用 D1 数据库**（免费 5M 行读取/天）：适合超大量文件
+3. **合并写入操作**：减少单文件操作频率
 
 ## 🏗️ 技术栈
 
