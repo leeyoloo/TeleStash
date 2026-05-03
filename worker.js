@@ -210,12 +210,17 @@ let ctxTarget=null;
 async function doLogin(){
   const pwd=document.getElementById('loginPwd').value;
   const errEl=document.getElementById('loginErr');
+  const btn=document.querySelector('.login-box button');
+  if(!pwd){errEl.textContent='请输入密码';return;}
+  btn.textContent='登录中...';btn.disabled=true;errEl.textContent='';
   try{
     const r=await fetch(API+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));errEl.textContent=d.error||'服务器错误 ('+r.status+')';btn.textContent='登 录';btn.disabled=false;return;}
     const d=await r.json();
-    if(d.ok){sessionStorage.setItem('token',d.token);showApp();}
-    else errEl.textContent=d.error||'密码错误';
-  }catch(e){errEl.textContent='连接失败';}
+    if(d.ok){sessionStorage.setItem('token',d.token);await showApp();}
+    else{errEl.textContent=d.error||'密码错误';}
+  }catch(e){errEl.textContent='连接失败: '+e.message;}
+  btn.textContent='登 录';btn.disabled=false;
 }
 
 async function apiFetch(path,opts={}){
@@ -229,16 +234,22 @@ async function apiFetch(path,opts={}){
 async function showApp(){
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('appScreen').style.display='flex';
-  await loadFiles();
+  try{
+    await loadFiles();
+  }catch(e){
+    document.getElementById('fileGrid').innerHTML='<div class="empty"><div class="icon">⚠️</div><p>加载失败</p><p style="font-size:13px;color:var(--red)">'+esc(e.message)+'</p><p style="font-size:13px;margin-top:12px">请检查 KV 绑定是否正确配置</p></div>';
+  }
 }
 
 async function loadFiles(){
-  try{
-    const r=await apiFetch('/api/files?path='+encodeURIComponent(currentPath));
-    if(!r)return;
-    const d=await r.json();
-    renderBreadcrumbs();renderTree(d.tree||[]);renderFiles(d.items||[]);renderStorage(d.stats||{});
-  }catch(e){toast('加载失败: '+e.message,'error');}
+  const r=await apiFetch('/api/files?path='+encodeURIComponent(currentPath));
+  if(!r)throw new Error('未登录或会话过期');
+  if(!r.ok){
+    const d=await r.json().catch(()=>({}));
+    throw new Error(d.error||'服务器错误 ('+r.status+')');
+  }
+  const d=await r.json();
+  renderBreadcrumbs();renderTree(d.tree||[]);renderFiles(d.items||[]);renderStorage(d.stats||{});
 }
 
 function renderBreadcrumbs(){
