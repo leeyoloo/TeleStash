@@ -649,13 +649,45 @@ function getZipFileData(data, entry) {
   return rawData;
 }
 
+// Async version that handles decompression
+async function getZipFileDataAsync(data, entry) {
+  const view = new DataView(data.buffer || data);
+  const nameLen = view.getUint16(entry.localOffset + 26, true);
+  const extraLen = view.getUint16(entry.localOffset + 28, true);
+  const dataStart = entry.localOffset + 30 + nameLen + extraLen;
+  if (entry.compMethod === 0) {
+    return data.slice(dataStart, dataStart + entry.compSize);
+  }
+  if (entry.compMethod === 8 && typeof DecompressionStream !== 'undefined') {
+    const rawData = data.slice(dataStart, dataStart + entry.compSize);
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    writer.write(rawData);
+    writer.close();
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const result = new Uint8Array(totalLen);
+    let off = 0;
+    for (const c of chunks) { result.set(c, off); off += c.length; }
+    return result;
+  }
+  return data.slice(dataStart, dataStart + entry.compSize);
+}
+
 async function extractEpubCover(fileData) {
   try {
     const entries = parseZipEntries(fileData);
     // Find container.xml
     const container = entries.find(e => e.name === 'META-INF/container.xml');
     if (!container) return null;
-    const containerXml = new TextDecoder().decode(getZipFileData(fileData, container));
+    const containerData = await getZipFileDataAsync(fileData, container);
+    const containerXml = new TextDecoder().decode(containerData);
     // Find OPF file path
     const rootMatch = containerXml.match(/full-path="([^"]+)"/);
     if (!rootMatch) return null;
@@ -664,7 +696,8 @@ async function extractEpubCover(fileData) {
     // Find OPF file
     const opfEntry = entries.find(e => e.name === opfPath);
     if (!opfEntry) return null;
-    const opfXml = new TextDecoder().decode(getZipFileData(fileData, opfEntry));
+    const opfData = await getZipFileDataAsync(fileData, opfEntry);
+    const opfXml = new TextDecoder().decode(opfData);
     // Find cover image: try meta name="cover" first
     let coverId = null;
     const coverMeta = opfXml.match(/name="cover"\s+content="([^"]+)"/);
@@ -695,49 +728,19 @@ async function extractEpubCover(fileData) {
       const coverFile = entries.find(e => /cover\.(jpg|jpeg|png|webp)/i.test(e.name));
       if (coverFile) coverHref = coverFile.name;
     }
+    // Fallback: find any image file in the EPUB
+    if (!coverHref) {
+      const imgFile = entries.find(e => /\.(jpg|jpeg|png|webp)$/i.test(e.name));
+      if (imgFile) coverHref = imgFile.name;
+    }
     if (!coverHref) return null;
     // Decode URL-encoded path
     coverHref = decodeURIComponent(coverHref);
     // Find and extract the cover image
     const imgEntry = entries.find(e => e.name === coverHref);
     if (!imgEntry) return null;
-    const imgData = getZipFileData(fileData, imgEntry);
-    if (!imgData) {
-      // Try async decompression
-      if (imgEntry.compMethod === 8 && typeof DecompressionStream !== 'undefined') {
-        const ds = new DecompressionStream('deflate-raw');
-        const writer = ds.writable.getWriter();
-        const rawData = fileData.slice(
-          (() => {
-            const view = new DataView(fileData.buffer || fileData);
-            const nl = view.getUint16(imgEntry.localOffset + 26, true);
-            const el = view.getUint16(imgEntry.localOffset + 28, true);
-            return imgEntry.localOffset + 30 + nl + el;
-          })(),
-          (() => {
-            const view = new DataView(fileData.buffer || fileData);
-            const nl = view.getUint16(imgEntry.localOffset + 26, true);
-            const el = view.getUint16(imgEntry.localOffset + 28, true);
-            return imgEntry.localOffset + 30 + nl + el + imgEntry.compSize;
-          })()
-        );
-        writer.write(rawData);
-        writer.close();
-        const reader = ds.readable.getReader();
-        const chunks = [];
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-        }
-        const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-        const result = new Uint8Array(totalLen);
-        let off = 0;
-        for (const c of chunks) { result.set(c, off); off += c.length; }
-        return { data: result, type: imgEntry.name.match(/\.png$/i) ? 'image/png' : 'image/jpeg' };
-      }
-      return null;
-    }
+    const imgData = await getZipFileDataAsync(fileData, imgEntry);
+    if (!imgData || imgData.length === 0) return null;
     const type = imgEntry.name.match(/\.png$/i) ? 'image/png' : 'image/jpeg';
     return { data: imgData, type };
   } catch (e) {
@@ -1115,7 +1118,7 @@ function json(data, headers = {}, status = 200) {
 
 // ===== WebDAV Handler =====
 async function handleWebDAV(request, env, cfg, path, corsHeaders) {
-  const davPath = sanitizePath(path.slice(4)) || '/'; // Remove '/dav' and sanitize
+  const davPath = sanitizePath(decodeURIComponent(path.slice(4))) || '/'; // Remove '/dav', decode, sanitize
   const method = request.method;
 
   // Basic Auth
@@ -1359,7 +1362,7 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
 
   // Parse bucket and key from path
   // /s3/bucket/key or /s3/bucket
-  const s3Path = sanitizePath(path.slice(4)); // Remove '/s3' and sanitize
+  const s3Path = sanitizePath(decodeURIComponent(path.slice(4))); // Remove '/s3', decode, sanitize
   const parts = s3Path.split('/').filter(Boolean);
   const bucket = parts[0] || '';
   const key = parts.slice(1).join('/');
@@ -1481,7 +1484,7 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
     });
   }
 
-  const opdsPath = sanitizePath(path.slice(5)) || '/'; // Remove '/opds' and sanitize
+  const opdsPath = sanitizePath(decodeURIComponent(path.slice(5))) || '/'; // Remove '/opds', decode, sanitize
   const baseUrl = '/opds';
 
   // Cover image endpoint
@@ -1490,7 +1493,7 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
     const item = await findFile(env.KV, filePath);
     if (!item) return new Response('Not Found', { status: 404, headers: corsHeaders });
 
-    const cacheKey = 'cover:' + filePath;
+    const cacheKey = 'cover:v2:' + filePath;
     const cached = await env.KV.get(cacheKey, 'arrayBuffer');
     if (cached) {
       const ct = await env.KV.get(cacheKey + ':type') || 'image/jpeg';
