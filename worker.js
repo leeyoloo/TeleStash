@@ -741,11 +741,12 @@ function opdsFeed(title, entries, baseUrl) {
     xml += '    <title>' + escXml(entry.title) + '</title>\n';
     xml += '    <id>' + escXml(entry.id) + '</id>\n';
     xml += '    <updated>' + new Date(entry.updated || Date.now()).toISOString() + '</updated>\n';
-    if (entry.link) {
-      xml += '    <link rel="' + (entry.rel || 'http://opds-spec.org/acquisition/open-access') + '" href="' + escXml(entry.link) + '" type="' + (entry.type || 'application/epub+zip') + '"/>\n';
-    }
     if (entry.isNav) {
+      // Navigation entries (folders) - only subsection link, no acquisition link
       xml += '    <link rel="subsection" href="' + escXml(entry.link) + '" type="application/atom+xml;profile=opds-catalog"/>\n';
+    } else if (entry.link) {
+      // Acquisition entries (books/files)
+      xml += '    <link rel="' + (entry.rel || 'http://opds-spec.org/acquisition/open-access') + '" href="' + escXml(entry.link) + '" type="' + (entry.type || 'application/epub+zip') + '"/>\n';
     }
     if (entry.image) {
       xml += '    <link rel="http://opds-spec.org/image" href="' + escXml(entry.image) + '" type="image/jpeg"/>\n';
@@ -1253,9 +1254,14 @@ async function handleWebDAV(request, env, cfg, path, corsHeaders) {
     const dest = request.headers.get('Destination');
     if (!dest) return new Response('Bad Request', { status: 400, headers: corsHeaders });
 
-    // Parse destination path (remove host part)
+    // Parse destination path (remove host part) - robust URL decoding
     let destPath;
-    try { destPath = new URL(dest).pathname.slice(4); } catch { destPath = dest.slice(4); }
+    try {
+      const parsedUrl = new URL(dest);
+      destPath = decodeURIComponent(parsedUrl.pathname.slice(4));
+    } catch {
+      destPath = decodeURIComponent(dest.slice(4));
+    }
     if (!destPath) destPath = davPath;
 
     const item = await findFile(env.KV, davPath);
@@ -1364,8 +1370,10 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
   // Put object
   if (request.method === 'PUT' && key) {
     const filePath = '/' + bucket + '/' + key;
-    const parentPath = '/' + bucket + '/' + key.split('/').slice(0, -1).join('/');
-    const fileName = key.split('/').pop();
+    const keyParts = key.split('/');
+    const fileName = keyParts.pop();
+    const keyDir = keyParts.join('/');
+    const parentPath = keyDir ? '/' + bucket + '/' + keyDir : '/' + bucket;
     const body = await request.arrayBuffer();
 
     if (body.byteLength > 50 * 1024 * 1024) {
@@ -1384,8 +1392,7 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
     if (!tgData.ok) return new Response('Upload failed', { status: 500, headers: corsHeaders });
 
     // Update KV
-    const normalizedParent = parentPath === '/' + bucket + '/' ? '/' + bucket : parentPath;
-    const dir = await getDir(env.KV, normalizedParent);
+    const dir = await getDir(env.KV, parentPath);
     const oldIdx = dir.items.findIndex(i => i.name === fileName);
     if (oldIdx >= 0) dir.items.splice(oldIdx, 1);
 
@@ -1395,7 +1402,7 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
       msg_id: tgData.result.message_id, size: doc.file_size || body.byteLength,
       date: Date.now(), is_dir: false
     });
-    await saveDir(env.KV, normalizedParent, dir);
+    await saveDir(env.KV, parentPath, dir);
 
     return new Response('', { status: 200, headers: { 'ETag': '"' + doc.file_id.slice(0, 16) + '"', ...corsHeaders } });
   }
