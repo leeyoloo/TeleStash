@@ -461,7 +461,8 @@ async function tgApi(token, method, body) {
 // ===== JWT (HMAC-SHA256) =====
 async function createToken(secret) {
   const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).replace(/=/g, '');
-  const payload = btoa(JSON.stringify({ sub: 'admin', iat: Date.now() })).replace(/=/g, '');
+  const now = Date.now();
+  const payload = btoa(JSON.stringify({ sub: 'admin', iat: now, exp: now + 7 * 24 * 60 * 60 * 1000 })).replace(/=/g, '');
   const data = header + '.' + payload;
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
@@ -477,7 +478,11 @@ async function verifyToken(token, secret) {
     const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
     const sigStr = parts[2].replace(/-/g, '+').replace(/_/g, '/');
     const sig = Uint8Array.from(atob(sigStr), c => c.charCodeAt(0));
-    return await crypto.subtle.verify('HMAC', key, sig, new TextEncoder().encode(data));
+    if (!(await crypto.subtle.verify('HMAC', key, sig, new TextEncoder().encode(data)))) return false;
+    // Check expiration
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    if (payload.exp && Date.now() > payload.exp) return false;
+    return true;
   } catch { return false; }
 }
 
@@ -523,6 +528,18 @@ async function removeFromParent(kv, parentPath, name) {
   const dir = await getDir(kv, parentPath);
   dir.items = dir.items.filter(i => i.name !== name);
   await saveDir(kv, parentPath, dir);
+}
+
+// ===== Path sanitization (prevent traversal) =====
+function sanitizePath(p) {
+  const parts = p.split('/').filter(Boolean);
+  const clean = [];
+  for (const part of parts) {
+    if (part === '..') continue; // block traversal
+    if (part === '.') continue;
+    clean.push(part);
+  }
+  return '/' + clean.join('/');
 }
 
 // ===== Find file by path =====
@@ -736,6 +753,7 @@ function opdsFeed(title, entries, baseUrl) {
   xml += '  <id>' + escXml(baseUrl) + '</id>\n';
   xml += '  <updated>' + new Date().toISOString() + '</updated>\n';
   xml += '  <link rel="self" href="' + escXml(baseUrl) + '" type="application/atom+xml;profile=opds-catalog"/>\n';
+  xml += '  <author><name>TeleStash</name></author>\n';
   for (const entry of entries) {
     xml += '  <entry>\n';
     xml += '    <title>' + escXml(entry.title) + '</title>\n';
@@ -805,6 +823,7 @@ function webdavMultistatus(items, baseUrl) {
       xml += '        <D:resourcetype/>\n';
       xml += '        <D:getcontentlength>' + (item.size || 0) + '</D:getcontentlength>\n';
       xml += '        <D:getcontenttype>' + escXml(getMimeType(item.name)) + '</D:getcontenttype>\n';
+      if (item.file_id) xml += '        <D:getetag>"' + item.file_id.slice(0, 16) + '"</D:getetag>\n';
     }
     xml += '        <D:getlastmodified>' + new Date(item.date || Date.now()).toUTCString() + '</D:getlastmodified>\n';
     xml += '      </D:prop>\n';
@@ -835,12 +854,17 @@ function getMimeType(name) {
 }
 
 // ===== S3 XML Helpers =====
-function s3ListBucket(bucket, objects, baseUrl) {
+function s3ListBucket(bucket, objects, prefixes, baseUrl) {
   let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
   xml += '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n';
   xml += '  <Name>' + escXml(bucket) + '</Name>\n';
   xml += '  <Prefix></Prefix>\n';
   xml += '  <IsTruncated>false</IsTruncated>\n';
+  for (const prefix of prefixes) {
+    xml += '  <CommonPrefixes>\n';
+    xml += '    <Prefix>' + escXml(prefix) + '</Prefix>\n';
+    xml += '  </CommonPrefixes>\n';
+  }
   for (const obj of objects) {
     xml += '  <Contents>\n';
     xml += '    <Key>' + escXml(obj.name) + '</Key>\n';
@@ -979,7 +1003,15 @@ export default {
           date: Date.now(),
           is_dir: false
         };
-        await addToParent(env.KV, dirPath, item);
+        // Remove old file with same name if exists
+        const dir = await getDir(env.KV, dirPath);
+        const oldIdx = dir.items.findIndex(i => i.name === file.name && !i.is_dir);
+        if (oldIdx >= 0) {
+          try { await tgApi(cfg.token, 'deleteMessage', { chat_id: cfg.channelId, message_id: dir.items[oldIdx].msg_id }); } catch (e) {}
+          dir.items.splice(oldIdx, 1);
+        }
+        dir.items.push(item);
+        await saveDir(env.KV, dirPath, dir);
         return json({ ok: true, item }, corsHeaders);
       }
 
@@ -1083,7 +1115,7 @@ function json(data, headers = {}, status = 200) {
 
 // ===== WebDAV Handler =====
 async function handleWebDAV(request, env, cfg, path, corsHeaders) {
-  const davPath = path.slice(4) || '/'; // Remove '/dav'
+  const davPath = sanitizePath(path.slice(4)) || '/'; // Remove '/dav' and sanitize
   const method = request.method;
 
   // Basic Auth
@@ -1327,7 +1359,7 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
 
   // Parse bucket and key from path
   // /s3/bucket/key or /s3/bucket
-  const s3Path = path.slice(4); // Remove '/s3'
+  const s3Path = sanitizePath(path.slice(4)); // Remove '/s3' and sanitize
   const parts = s3Path.split('/').filter(Boolean);
   const bucket = parts[0] || '';
   const key = parts.slice(1).join('/');
@@ -1337,7 +1369,8 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
     const dirPath = bucket ? '/' + bucket : '/';
     const dir = await getDir(env.KV, dirPath);
     const objects = dir.items.filter(i => !i.is_dir).map(i => ({ name: i.name, size: i.size, date: i.date }));
-    const xml = s3ListBucket(bucket || 'telestash', objects);
+    const prefixes = dir.items.filter(i => i.is_dir).map(i => i.name + '/');
+    const xml = s3ListBucket(bucket || 'telestash', objects, prefixes);
     return new Response(xml, { headers: { 'Content-Type': 'application/xml', ...corsHeaders } });
   }
 
@@ -1448,7 +1481,7 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
     });
   }
 
-  const opdsPath = path.slice(5) || '/'; // Remove '/opds'
+  const opdsPath = sanitizePath(path.slice(5)) || '/'; // Remove '/opds' and sanitize
   const baseUrl = '/opds';
 
   // Cover image endpoint
