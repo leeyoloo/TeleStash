@@ -426,7 +426,7 @@ function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 function formatSize(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
 function getFileIcon(name){
   const ext=name.split('.').pop().toLowerCase();
-  const m={jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',mp4:'🎬',mkv:'🎬',avi:'🎬',mov:'🎬',mp3:'🎵',wav:'🎵',flac:'🎵',pdf:'📄',doc:'📝',docx:'📝',xls:'📊',xlsx:'📊',ppt:'📽️',pptx:'📽️',txt:'📄',md:'📄',json:'📋',csv:'📊',zip:'📦',rar:'📦',7z:'📦',exe:'⚙️',js:'💻',ts:'💻',py:'💻',epub:'📖',mobi:'📖',cbr:'📖',cbz:'📖'};
+  const m={jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',mp4:'🎬',mkv:'🎬',avi:'🎬',mov:'🎬',mp3:'🎵',wav:'🎵',flac:'🎵',pdf:'📄',doc:'📝',docx:'📝',xls:'📊',xlsx:'📊',ppt:'📽️',pptx:'📽️',txt:'📄',md:'📄',json:'📋',csv:'📊',zip:'📦',rar:'📦','7z':'📦',exe:'⚙️',js:'💻',ts:'💻',py:'💻',epub:'📖',mobi:'📖',cbr:'📖',cbz:'📖'};
   return m[ext]||'📄';
 }
 function toast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast show '+type;setTimeout(()=>el.className='toast',3000);}
