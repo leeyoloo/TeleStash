@@ -587,6 +587,147 @@ function generateS3Key() {
   return { access_key: accessKey, secret_key: secretKey };
 }
 
+// ===== EPUB Cover Extraction =====
+function parseZipEntries(data) {
+  const entries = [];
+  const view = new DataView(data.buffer || data);
+  const sig = 0x02014b50;
+  let pos = data.length - 22;
+  while (pos >= 0) {
+    if (view.getUint32(pos, true) === 0x06054b50) {
+      const cdSize = view.getUint32(pos + 12, true);
+      const cdOffset = view.getUint32(pos + 16, true);
+      pos = cdOffset;
+      break;
+    }
+    pos--;
+  }
+  if (pos < 0) return entries;
+  while (pos < data.length - 4) {
+    if (view.getUint32(pos, true) !== sig) break;
+    const compMethod = view.getUint16(pos + 10, true);
+    const compSize = view.getUint32(pos + 20, true);
+    const uncompSize = view.getUint32(pos + 24, true);
+    const nameLen = view.getUint16(pos + 28, true);
+    const extraLen = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const localOffset = view.getUint32(pos + 42, true);
+    const name = new TextDecoder().decode(data.slice(pos + 46, pos + 46 + nameLen));
+    entries.push({ name, compMethod, compSize, uncompSize, localOffset });
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+function getZipFileData(data, entry) {
+  const view = new DataView(data.buffer || data);
+  const nameLen = view.getUint16(entry.localOffset + 26, true);
+  const extraLen = view.getUint16(entry.localOffset + 28, true);
+  const dataStart = entry.localOffset + 30 + nameLen + extraLen;
+  const rawData = data.slice(dataStart, dataStart + entry.compSize);
+  if (entry.compMethod === 0) return rawData;
+  if (entry.compMethod === 8 && typeof DecompressionStream !== 'undefined') {
+    return null; // async needed, handled in caller
+  }
+  return rawData;
+}
+
+async function extractEpubCover(fileData) {
+  try {
+    const entries = parseZipEntries(fileData);
+    // Find container.xml
+    const container = entries.find(e => e.name === 'META-INF/container.xml');
+    if (!container) return null;
+    const containerXml = new TextDecoder().decode(getZipFileData(fileData, container));
+    // Find OPF file path
+    const rootMatch = containerXml.match(/full-path="([^"]+)"/);
+    if (!rootMatch) return null;
+    const opfPath = rootMatch[1];
+    const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+    // Find OPF file
+    const opfEntry = entries.find(e => e.name === opfPath);
+    if (!opfEntry) return null;
+    const opfXml = new TextDecoder().decode(getZipFileData(fileData, opfEntry));
+    // Find cover image: try meta name="cover" first
+    let coverId = null;
+    const coverMeta = opfXml.match(/name="cover"\s+content="([^"]+)"/);
+    if (coverMeta) coverId = coverMeta[1];
+    // Also try <meta property="cover"> (EPUB3)
+    if (!coverId) {
+      const coverProp = opfXml.match(/property="cover"[^>]*>([^<]+)</);
+      if (coverProp) coverId = coverProp[1].trim();
+    }
+    // Find the item with cover id or cover-image property
+    let coverHref = null;
+    if (coverId) {
+      const idMatch = opfXml.match(new RegExp('id="' + coverId + '"[^>]*href="([^"]+)"'));
+      if (idMatch) coverHref = opfDir + idMatch[1];
+    }
+    // Fallback: find item with properties="cover-image" (EPUB3)
+    if (!coverHref) {
+      const propsMatch = opfXml.match(/properties="cover-image"\s+href="([^"]+)"/);
+      if (!propsMatch) {
+        const propsMatch2 = opfXml.match(/href="([^"]+)"[^>]*properties="cover-image"/);
+        if (propsMatch2) coverHref = opfDir + propsMatch2[1];
+      } else {
+        coverHref = opfDir + propsMatch[1];
+      }
+    }
+    // Fallback: find file named cover.jpg/png in entries
+    if (!coverHref) {
+      const coverFile = entries.find(e => /cover\.(jpg|jpeg|png|webp)/i.test(e.name));
+      if (coverFile) coverHref = coverFile.name;
+    }
+    if (!coverHref) return null;
+    // Decode URL-encoded path
+    coverHref = decodeURIComponent(coverHref);
+    // Find and extract the cover image
+    const imgEntry = entries.find(e => e.name === coverHref);
+    if (!imgEntry) return null;
+    const imgData = getZipFileData(fileData, imgEntry);
+    if (!imgData) {
+      // Try async decompression
+      if (imgEntry.compMethod === 8 && typeof DecompressionStream !== 'undefined') {
+        const ds = new DecompressionStream('deflate-raw');
+        const writer = ds.writable.getWriter();
+        const rawData = fileData.slice(
+          (() => {
+            const view = new DataView(fileData.buffer || fileData);
+            const nl = view.getUint16(imgEntry.localOffset + 26, true);
+            const el = view.getUint16(imgEntry.localOffset + 28, true);
+            return imgEntry.localOffset + 30 + nl + el;
+          })(),
+          (() => {
+            const view = new DataView(fileData.buffer || fileData);
+            const nl = view.getUint16(imgEntry.localOffset + 26, true);
+            const el = view.getUint16(imgEntry.localOffset + 28, true);
+            return imgEntry.localOffset + 30 + nl + el + imgEntry.compSize;
+          })()
+        );
+        writer.write(rawData);
+        writer.close();
+        const reader = ds.readable.getReader();
+        const chunks = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+        const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+        const result = new Uint8Array(totalLen);
+        let off = 0;
+        for (const c of chunks) { result.set(c, off); off += c.length; }
+        return { data: result, type: imgEntry.name.match(/\.png$/i) ? 'image/png' : 'image/jpeg' };
+      }
+      return null;
+    }
+    const type = imgEntry.name.match(/\.png$/i) ? 'image/png' : 'image/jpeg';
+    return { data: imgData, type };
+  } catch (e) {
+    return null;
+  }
+}
+
 // ===== OPDS XML Builder =====
 function opdsFeed(title, entries, baseUrl) {
   let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
@@ -605,6 +746,10 @@ function opdsFeed(title, entries, baseUrl) {
     }
     if (entry.isNav) {
       xml += '    <link rel="subsection" href="' + escXml(entry.link) + '" type="application/atom+xml;profile=opds-catalog"/>\n';
+    }
+    if (entry.image) {
+      xml += '    <link rel="http://opds-spec.org/image" href="' + escXml(entry.image) + '" type="image/jpeg"/>\n';
+      xml += '    <link rel="http://opds-spec.org/image/thumbnail" href="' + escXml(entry.image) + '" type="image/jpeg"/>\n';
     }
     if (entry.content) xml += '    <content type="text">' + escXml(entry.content) + '</content>\n';
     xml += '  </entry>\n';
@@ -1299,6 +1444,38 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
   const opdsPath = path.slice(5) || '/'; // Remove '/opds'
   const baseUrl = '/opds';
 
+  // Cover image endpoint
+  if (opdsPath.startsWith('/cover')) {
+    const filePath = opdsPath.slice(6); // Remove '/cover'
+    const item = await findFile(env.KV, filePath);
+    if (!item) return new Response('Not Found', { status: 404, headers: corsHeaders });
+
+    const cacheKey = 'cover:' + filePath;
+    const cached = await env.KV.get(cacheKey, 'arrayBuffer');
+    if (cached) {
+      const ct = await env.KV.get(cacheKey + ':type') || 'image/jpeg';
+      return new Response(cached, { headers: { 'Content-Type': ct, 'Cache-Control': 'public, max-age=86400', ...corsHeaders } });
+    }
+
+    const fileInfoResp = await tgApi(cfg.token, 'getFile', { file_id: item.file_id });
+    const fileInfo = await fileInfoResp.json();
+    if (!fileInfo.ok) return new Response('Error', { status: 500, headers: corsHeaders });
+
+    const fileUrl = 'https://api.telegram.org/file/bot' + cfg.token + '/' + fileInfo.result.file_path;
+    const fileResp = await fetch(fileUrl);
+    const fileData = new Uint8Array(await fileResp.arrayBuffer());
+
+    const cover = await extractEpubCover(fileData);
+    if (!cover) return new Response('No Cover', { status: 404, headers: corsHeaders });
+
+    try {
+      await env.KV.put(cacheKey, cover.data.buffer || cover.data, { expirationTtl: 86400 });
+      await env.KV.put(cacheKey + ':type', cover.type, { expirationTtl: 86400 });
+    } catch (e) {}
+
+    return new Response(cover.data, { headers: { 'Content-Type': cover.type, 'Cache-Control': 'public, max-age=86400', ...corsHeaders } });
+  }
+
   // Root catalog
   if (opdsPath === '/') {
     const dir = await getDir(env.KV, '/');
@@ -1320,7 +1497,8 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
           id: 'book:' + item.path,
           link: baseUrl + '/download' + item.path,
           type: ebookMimeType(item.name),
-          content: formatSize(item.size)
+          content: formatSize(item.size),
+          image: item.name.endsWith('.epub') ? baseUrl + '/cover' + item.path : null
         });
       }
     }
@@ -1330,7 +1508,7 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
   }
 
   // Sub-directory
-  if (!opdsPath.startsWith('/download')) {
+  if (!opdsPath.startsWith('/download') && !opdsPath.startsWith('/cover')) {
     const dir = await getDir(env.KV, opdsPath);
     const entries = [];
 
@@ -1349,7 +1527,8 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
           id: 'book:' + item.path,
           link: baseUrl + '/download' + item.path,
           type: ebookMimeType(item.name),
-          content: formatSize(item.size)
+          content: formatSize(item.size),
+          image: item.name.endsWith('.epub') ? baseUrl + '/cover' + item.path : null
         });
       }
     }
