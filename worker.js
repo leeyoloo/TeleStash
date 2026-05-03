@@ -1583,7 +1583,7 @@ async function handleOPDS(request, env, cfg, path, url, corsHeaders) {
 
   // Download ebook
   if (opdsPath.startsWith('/download')) {
-    const filePath = opdsPath.slice(8); // Remove '/download'
+    const filePath = opdsPath.slice(9); // Remove '/download'
     const item = await findFile(env.KV, filePath);
     if (!item) return new Response('Not Found', { status: 404, headers: corsHeaders });
 
