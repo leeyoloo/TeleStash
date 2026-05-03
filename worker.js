@@ -442,7 +442,7 @@ function getConfig(env) {
     token: env.TELEGRAM_BOT_TOKEN,
     channelId: env.TELEGRAM_CHANNEL_ID,
     adminPwd: env.ADMIN_PASSWORD || 'admin',
-    secret: (env.TELEGRAM_BOT_TOKEN || '') + (env.TELEGRAM_CHANNEL_ID || '')
+    secret: env.JWT_SECRET || ((env.TELEGRAM_BOT_TOKEN || '') + (env.TELEGRAM_CHANNEL_ID || ''))
   };
 }
 
@@ -580,8 +580,12 @@ async function buildTree(kv) {
   return rootDir.items.filter(i => i.is_dir).map(i => ({ name: i.name, path: i.path }));
 }
 
-// ===== Stats =====
+// ===== Stats (with KV cache, 60s TTL) =====
 async function getStats(kv) {
+  const cached = await kv.get('_stats_cache', 'json');
+  if (cached && cached.ts && Date.now() - cached.ts < 60000) {
+    return { totalFiles: cached.totalFiles, totalSize: cached.totalSize };
+  }
   let totalFiles = 0, totalSize = 0;
   async function countDir(dirPath) {
     const dir = await getDir(kv, dirPath);
@@ -591,7 +595,9 @@ async function getStats(kv) {
     }
   }
   await countDir('/');
-  return { totalFiles, totalSize };
+  const result = { totalFiles, totalSize };
+  try { await kv.put('_stats_cache', JSON.stringify({ ...result, ts: Date.now() }), { expirationTtl: 120 }); } catch (e) {}
+  return result;
 }
 
 // ===== S3 Signature (简化版: 支持 Basic Auth 和 Query Auth) =====
@@ -1051,7 +1057,11 @@ export default {
 
         item.name = newName;
         item.path = joinPath(parentPath, newName);
-        const idx = dir.items.findIndex(i => i.name === item.name);
+        // Check if destination name already exists (don't silently overwrite)
+        const existIdx = dir.items.findIndex(i => i.name === newName && i.path !== oldPath);
+        if (existIdx >= 0) return json({ error: '同名文件已存在' }, corsHeaders, 409);
+
+        const idx = dir.items.findIndex(i => i.path === oldPath);
         if (idx >= 0) dir.items[idx] = item;
         await saveDir(env.KV, parentPath, dir);
 
@@ -1299,8 +1309,18 @@ async function handleWebDAV(request, env, cfg, path, corsHeaders) {
     }
     if (!destPath) destPath = davPath;
 
-    const item = await findFile(env.KV, davPath);
-    if (!item) return new Response('Not Found', { status: 404, headers: corsHeaders });
+    // Find file or directory
+    let item = await findFile(env.KV, davPath);
+    let isDir = false;
+    if (!item) {
+      // Check if it's a directory
+      const srcParent = getParentPath(davPath) || '/';
+      const srcDir = await getDir(env.KV, srcParent);
+      const dirItem = srcDir.items.find(i => i.path === davPath && i.is_dir);
+      if (!dirItem) return new Response('Not Found', { status: 404, headers: corsHeaders });
+      item = dirItem;
+      isDir = true;
+    }
 
     const overwrite = request.headers.get('Overwrite') !== 'F';
     const destParent = getParentPath(destPath) || '/';
@@ -1312,7 +1332,9 @@ async function handleWebDAV(request, env, cfg, path, corsHeaders) {
     if (existIdx >= 0 && !overwrite) return new Response('Precondition Failed', { status: 412, headers: corsHeaders });
     if (existIdx >= 0) {
       const exist = destDir.items[existIdx];
-      if (!exist.is_dir) {
+      if (exist.is_dir) {
+        await deleteRecursive(env.KV, exist.path);
+      } else {
         try { await tgApi(cfg.token, 'deleteMessage', { chat_id: cfg.channelId, message_id: exist.msg_id }); } catch (e) {}
       }
       destDir.items.splice(existIdx, 1);
@@ -1325,8 +1347,30 @@ async function handleWebDAV(request, env, cfg, path, corsHeaders) {
 
     // If MOVE, remove from source
     if (method === 'MOVE') {
-      const srcParent = getParentPath(davPath) || '/';
-      await removeFromParent(env.KV, srcParent, item.name);
+      const srcParentPath = getParentPath(davPath) || '/';
+      await removeFromParent(env.KV, srcParentPath, item.name);
+      // If directory, move all children and update paths
+      if (isDir) {
+        const srcDirData = await getDir(env.KV, davPath);
+        await saveDir(env.KV, destPath, srcDirData);
+        await kv.delete('dir:' + davPath);
+        // Update child paths recursively
+        async function updatePaths(oldBase, newBase, dirData) {
+          for (const child of dirData.items) {
+            const oldChildPath = oldBase + '/' + child.name;
+            const newChildPath = newBase + '/' + child.name;
+            child.path = newChildPath;
+            if (child.is_dir) {
+              const childDir = await getDir(env.KV, oldChildPath);
+              await updatePaths(oldChildPath, newChildPath, childDir);
+              await saveDir(env.KV, newChildPath, childDir);
+              await env.KV.delete('dir:' + oldChildPath);
+            }
+          }
+          await saveDir(env.KV, newBase, dirData);
+        }
+        await updatePaths(davPath, destPath, srcDirData);
+      }
     }
 
     return new Response(method === 'MOVE' ? 'No Content' : 'Created', {
@@ -1448,7 +1492,10 @@ async function handleS3(request, env, cfg, path, url, corsHeaders) {
     const filePath = '/' + bucket + '/' + key;
     const item = await findFile(env.KV, filePath);
     if (item) {
-      try { await tgApi(cfg.token, 'deleteMessage', { chat_id: cfg.channelId, message_id: item.msg_id }); } catch (e) {}
+      // Delete from Telegram too
+      if (item.msg_id) {
+        try { await tgApi(cfg.token, 'deleteMessage', { chat_id: cfg.channelId, message_id: item.msg_id }); } catch (e) {}
+      }
       const parentPath = getParentPath(filePath) || '/' + bucket;
       await removeFromParent(env.KV, parentPath, item.name);
     }
